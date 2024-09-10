@@ -21,22 +21,25 @@ let recordings = {};
 
 // Load existing recordings from JSON file if it exists
 if (fs.existsSync('recordings.json')) {
-  const data = fs.readFileSync('recordings.json', 'utf8');
-  recordings = JSON.parse(data);
+  try {
+    const data = fs.readFileSync('recordings.json', 'utf8');
+    recordings = JSON.parse(data);
+  } catch (error) {
+    console.error('Error loading recordings.json:', error);
+  }
 }
 
 // Ensure uploads directory exists
-if (!fs.existsSync(path.join(__dirname, 'uploads'))) {
-  fs.mkdirSync(path.join(__dirname, 'uploads'));
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir);
 }
 
 app.post('/start-session', (req, res) => {
   const sessionId = Date.now().toString();
   recordings[sessionId] = [];
-  const sessionDir = path.join(__dirname, 'uploads', sessionId);
-  if (!fs.existsSync(sessionDir)) {
-    fs.mkdirSync(sessionDir, { recursive: true });
-  }
+  const sessionDir = path.join(uploadsDir, sessionId);
+  fs.mkdirSync(sessionDir, { recursive: true });
   res.json({ sessionId });
 });
 
@@ -46,7 +49,7 @@ app.get('/recordings', (req, res) => {
 
 app.get('/stream/:sessionId', (req, res) => {
   const { sessionId } = req.params;
-  const sessionDir = path.join(__dirname, 'uploads', sessionId);
+  const sessionDir = path.join(uploadsDir, sessionId);
   
   if (fs.existsSync(sessionDir)) {
     const files = fs.readdirSync(sessionDir).sort((a, b) => parseInt(a) - parseInt(b));
@@ -78,15 +81,31 @@ app.get('/stream/:sessionId', (req, res) => {
 io.on('connection', (socket) => {
   console.log('New client connected');
 
-  socket.on('stream', ({ sessionId, chunk }) => {
+  socket.on('stream', ({ sessionId, chunk }, callback) => {
+    console.log(`Received chunk for session ${sessionId}, size: ${chunk.byteLength} bytes`);
+    
     if (!recordings[sessionId]) {
       recordings[sessionId] = [];
     }
     const chunkId = recordings[sessionId].length;
     recordings[sessionId].push(chunkId);
-    const chunkPath = path.join(__dirname, 'uploads', sessionId, `${chunkId}.webm`);
+    
+    const chunkPath = path.join(uploadsDir, sessionId, `${chunkId}.webm`);
+    
     fs.writeFile(chunkPath, chunk, (err) => {
-      if (err) console.error('Error saving chunk:', err);
+      if (err) {
+        console.error('Error saving chunk:', err);
+        if (typeof callback === 'function') {
+          callback({ status: 'error', message: 'Failed to save chunk' });
+        }
+      } else {
+        console.log(`Chunk ${chunkId} saved for session ${sessionId}`);
+        if (typeof callback === 'function') {
+          callback({ status: 'received' });
+        }
+        // Emit an event to all clients (including the sender) that the stream was received
+        io.emit('stream_received', { sessionId, chunkId, chunkSize: chunk.byteLength });
+      }
     });
   });
 
@@ -96,11 +115,27 @@ io.on('connection', (socket) => {
 });
 
 // Save recordings to JSON file periodically
-setInterval(() => {
+const saveRecordings = () => {
   fs.writeFile('recordings.json', JSON.stringify(recordings), (err) => {
-    if (err) console.error('Error saving recordings.json:', err);
+    if (err) {
+      console.error('Error saving recordings.json:', err);
+    } else {
+      console.log('recordings.json saved successfully');
+    }
   });
-}, 5000);
+};
+
+setInterval(saveRecordings, 5000);
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('Shutting down gracefully...');
+  saveRecordings();
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
